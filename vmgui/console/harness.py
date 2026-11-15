@@ -44,6 +44,9 @@ ROOT = DPCTL.ROOT
 VM = DPCTL.VM
 SERIAL_LOG = DPCTL.SERIAL_LOG
 CONSOLE_PID_FILE = DPCTL.CONSOLE_PID_FILE
+# 控制台里的「启动时启用扫描翻译」开关（存在 = 下次冷启动跳过预加载）。
+# 放在 `vm/` 而不是 config.toml：它是这台 VM 的启动选项，不是客户端显示偏好。
+SCAN_OFF_FLAG = os.path.join(VM, "scan-off.flag")
 
 
 # --------------------------------------------------------------------------- #
@@ -495,8 +498,25 @@ def ensure_tone(path: Optional[str] = None, seconds: float = 1.0,
     return path
 
 
+def scan_enabled() -> bool:
+    """下次冷启动是否预加载「扫描翻译」（快速启动不受这个开关影响，固定关闭）。"""
+    return not os.path.exists(SCAN_OFF_FLAG)
+
+
+def set_scan_enabled(on: bool) -> None:
+    os.makedirs(VM, exist_ok=True)
+    if on:
+        try:
+            os.remove(SCAN_OFF_FLAG)
+        except OSError:
+            pass
+    else:
+        with open(SCAN_OFF_FLAG, "w", encoding="utf-8") as f:
+            f.write("scan translation boot preload disabled\n")
+
+
 def start_vm(pack: Optional[str], fresh: bool = False,
-             rescue: bool = False) -> tuple[int, str]:
+             rescue: bool = False, scan: Optional[bool] = None) -> tuple[int, str]:
     """起 VM。**必须 `--display none`** —— 控制台自己占 QMP（决策 #24）。"""
     args = ["up", "--display", "none"]
     if pack:
@@ -505,6 +525,8 @@ def start_vm(pack: Optional[str], fresh: bool = False,
         args.append("--fresh")
     if rescue:
         args.append("--rescue")
+    if not (scan_enabled() if scan is None else scan):
+        args.append("--no-scan")
     return run_dpctl(args, timeout=600)
 
 
@@ -519,8 +541,8 @@ def fast_status(pack: Optional[str]) -> dict:
 
 
 def start_vm_fast(pack: Optional[str]) -> tuple[int, str]:
-    """从首页快照恢复。快照盘是独立的 qcow2，里面没有音频。"""
-    args = ["up", "--display", "none", "--fast"]
+    """从首页快照恢复。快照盘是独立的 qcow2，里面没有音频；也不预加载扫描翻译。"""
+    args = ["up", "--display", "none", "--fast", "--no-scan"]
     if pack:
         args += ["--pack", pack]
     return run_dpctl(args, timeout=180)
@@ -597,6 +619,8 @@ def restart_vm(pack: Optional[str]) -> list:
     up = ["up", "--display", "none"]
     if pack:
         up += ["--pack", pack]
+    if not scan_enabled():
+        up.append("--no-scan")
     steps.append(("启动", up))
     done = []
     for label, argv in steps:

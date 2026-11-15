@@ -475,6 +475,38 @@ CLHOOK
 chmod +x $TARGET/etc/init.d/S00corelog
 echo "corelog hook installed"
 
+# --- 扫描翻译（SCANTRANS）预加载开关 -----------------------------------------
+# 起机时「查词翻译」页会被预加载（实测把首页出现时间推迟 ~2 s）。`DICTPEN_SCAN=0`
+# （dpctl up --no-scan；快速启动固定走这一路）在 miniapp 起来之前（S97）改写应用
+# 注册表的 props：去掉 Bootup、Preload=false，页面就不再预加载。
+# 打开扫描翻译时只恢复**我们自己关过**的注册表（marker 记在状态盘里），
+# 不去动厂商/用户本来就关掉的东西。
+cat > $TARGET/etc/init.d/S00scan <<'SCANEOF'
+#!/bin/sh
+# Toggle the SCANTRANS (查词翻译) boot preload according to DICTPEN_SCAN.
+MARK=/userdata/cfg/vm-scan/scan-off.flag
+FILES="/userdata/miniapp/data/mini_app/pkg/packages.json /userdisk/secondary/miniapp/data/mini_app/pkg/packages.json /userdisk/miniapp/data/mini_app/pkg/packages.json"
+if grep -q 'DICTPEN_SCAN=0' /proc/cmdline 2>/dev/null; then
+    for F in $FILES; do
+        [ -f "$F" ] || continue
+        sed -i -r 's/"Bootup"[[:space:]]*:[[:space:]]*\["lookup"\],[[:space:]]*"Preload"[[:space:]]*:[[:space:]]*true,/"Preload": false,/' "$F"
+        echo "S00scan: preload disabled ($F)" >/dev/kmsg
+    done
+    mkdir -p /userdata/cfg/vm-scan 2>/dev/null
+    : > "$MARK"
+else
+    [ -f "$MARK" ] || exit 0
+    for F in $FILES; do
+        [ -f "$F" ] || continue
+        sed -i -r 's/"Preload"[[:space:]]*:[[:space:]]*false,[[:space:]]*"addDesktop"/"Bootup": ["lookup"], "Preload": true, "addDesktop"/' "$F"
+        echo "S00scan: preload restored ($F)" >/dev/kmsg
+    done
+    rm -f "$MARK"
+fi
+SCANEOF
+chmod +x $TARGET/etc/init.d/S00scan
+echo "scan hook installed"
+
 # --- virtual access point (wlan1) -------------------------------------------
 # The pen's own Wi-Fi chip does AP mode in firmware and the rootfs ships no
 # hostapd, so the guest is given a matching aarch64 build (its kernel is
