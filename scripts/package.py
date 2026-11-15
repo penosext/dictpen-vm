@@ -31,8 +31,9 @@ import packlib                                                # noqa: E402
 # 只带这些（白名单比黑名单安全：新增大文件不会被误打进包里）
 # 不带 .trae（编辑器/agent 的工作目录，不是给人用的东西）
 INCLUDE_DIRS = ["scripts", "vmgui", "docs", "deps"]
-INCLUDE_FILES = ["README.md", ".gitignore", ".gitattributes", "run-vm.cmd",
-                 "stop-vm.cmd", "ssh-vm.cmd", "console.cmd", "vm-console.cmd",
+INCLUDE_FILES = ["README.md", ".gitignore", ".gitattributes",
+                 "run-vm.cmd", "stop-vm.cmd", "ssh-vm.cmd", "console.cmd", "vm-console.cmd",
+                 "run-vm.sh", "stop-vm.sh", "ssh-vm.sh", "console.sh", "vm-console.sh",
                  "downloads/releases.json"]
 # 固件包只带"描述"，不带固件派生的二进制（那些和镜像一样归有道，且很大）。
 # 具体带哪些由**包自己**说了算：`pack.toml` 的 `[dist].include` 追加，缺省是
@@ -166,7 +167,17 @@ def main():
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for rel in files:
-            z.write(os.path.join(ROOT, rel), arcname=rel.replace("\\", "/"))
+            src = os.path.join(ROOT, rel)
+            arc = rel.replace("\\", "/")
+            if arc.endswith(".sh"):
+                # Windows 上没有可执行位；Linux 包里的 .sh 要能直接 ./run-vm.sh
+                zi = zipfile.ZipInfo.from_file(src, arcname=arc)
+                zi.external_attr = (0o100755 << 16) | 0o644
+                with open(src, "rb") as f:
+                    z.writestr(zi, f.read(), compress_type=zipfile.ZIP_DEFLATED,
+                               compresslevel=9)
+            else:
+                z.write(src, arcname=arc)
     size = os.path.getsize(out)
     sha = hashlib.sha256(open(out, "rb").read()).hexdigest()
     print(f"\n{out}\n  {size / 1024:.0f} KB  sha256={sha}")

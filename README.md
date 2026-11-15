@@ -1,6 +1,6 @@
 # dictpen-vm — 有道词典笔实机模拟开发环境
 
-在 Windows 上用 QEMU 运行**词典笔真实固件**的虚拟机（不需要管理员权限，也不需要 WSL）。
+在 Windows 或 Linux 上用 QEMU 运行**词典笔真实固件**的虚拟机（不需要管理员权限，也不需要 WSL）。
 框架本身不含固件：一台机器会变的东西全在 `packs/<名字>/` 里，启动时用 `--pack` 选一台。
 仓库自带十个包：**a6pro / a7p / a7pro / p5 / s6pro / s7pro / x3s342 / x5pro / x6pro / x7**。
 
@@ -39,6 +39,27 @@ python scripts\dpctl.py down               :: 关机
 
 只想看笔的屏幕：`run-vm.cmd` 会弹出画面窗口（等价 `dpctl up`，默认显示前端是 vmgui）。
 
+### Linux 宿主（Ubuntu / Debian / Fedora）
+
+Linux 不下载 `tools/msys2` 里的 Windows 便携 QEMU，直接用发行版包；其余脚本同理。
+
+```bash
+# Ubuntu / Debian
+sudo apt install qemu-system-arm qemu-utils openssh-client python3 python3-venv
+# Fedora
+# sudo dnf install qemu-system-aarch64 qemu-img openssh-clients python3
+
+python3 -m pip install PySide6          # 控制台 / 实时画面需要；只用命令行可跳过
+python3 scripts/bootstrap.py            # Windows 专用项会自动跳过，QEMU 走系统包
+
+sh vm-console.sh                        # 打开控制台（点「启动」）
+sh run-vm.sh --pack s6pro               # 或直接起机
+sh stop-vm.sh
+```
+
+完整的依赖、端口、音频、环境变量、排障和与 Windows 的差异见
+[docs/Linux使用说明.md](docs/Linux使用说明.md)。
+
 ## 常用命令
 
 | 命令 | 一句话 |
@@ -65,6 +86,7 @@ python scripts\dpctl.py down               :: 关机
 | 文档 | 给谁看 |
 |---|---|
 | [docs/使用手册.md](docs/使用手册.md) | 想用起来：依赖、固件、启动、看画面与操作、传文件、adb、持久化、虚拟硬件、激活 |
+| [docs/Linux使用说明.md](docs/Linux使用说明.md) | 在 Linux 宿主上安装、启动、音频、排障 |
 | [docs/固件包开发教程.md](docs/固件包开发教程.md) | 想加一台机器：`pack.toml` 全字段、适配方式、写 runtime、检查清单 |
 | [docs/插件模型.md](docs/插件模型.md) | 想改框架 / 写插件：宿主与四个插件点、接口契约、零机型自检 |
 | [docs/疑难排查.md](docs/疑难排查.md) | 卡住了：黑屏花屏、触摸、联网、首启、激活、SSH/adb |

@@ -124,12 +124,32 @@ def main():
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         print(f"connected to {HOST}:{PORT} (Ctrl+] to quit)")
-        import msvcrt
-        while True:
-            ch = msvcrt.getwch()
-            if ch == "]":
-                break
-            s.send(ch.replace("\r", "\n") if ch == "\r" else ch)
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                ch = msvcrt.getwch()
+                if ch == "]":
+                    break
+                s.send(ch.replace("\r", "\n") if ch == "\r" else ch)
+        else:
+            # POSIX：cbreak 保留 Ctrl+C，同时能逐字符读到 Ctrl+]。
+            import select
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while True:
+                    ready, _, _ = select.select([fd], [], [], 0.2)
+                    if not ready:
+                        continue
+                    ch = sys.stdin.read(1)
+                    if not ch or ch == "]":
+                        break
+                    s.send("\n" if ch in ("\r", "\n") else ch)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
         stop.set()
         return 0
 

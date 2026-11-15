@@ -11,7 +11,9 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")      # 离屏建窗口（控制台那几测要用）
 
@@ -1892,7 +1894,9 @@ class TestPackSwitcher(unittest.TestCase):
         self.addCleanup(setattr, W.harness, "stop_vm", runs[2])
         self.addCleanup(setattr, W, "Thread", runs[3])
         self.addCleanup(setattr, W, "QMessageBox", runs[4])
+        saved_start = W.harness.start_vm
         W.harness.start_vm = lambda pack, fresh=False, **k: (0, f"up {pack}")
+        self.addCleanup(setattr, W.harness, "start_vm", saved_start)
         win._start_clicked()
         self.assertEqual(win.pack, "x7")
         self.assertIn("仅 x7 可用", win.cmdlog.toPlainText())
@@ -2384,6 +2388,37 @@ class TestConsolePointerBounds(unittest.TestCase):
     def test_release_without_press_is_ignored(self):
         self._release(self.t.ox + 100, self.t.oy + self.t.disp_h - 5)
         self.assertEqual(self.sent, [])
+
+    def test_right_click_becomes_a_left_to_right_swipe(self):
+        """右键 = 笔的返回手势：从画面左缘往右拖；右键本身不进客机。"""
+        from vmgui.backends.base import BUTTON_LEFT, BUTTON_RIGHT
+        from vmgui.console import window as W
+        saved = (W.threading.Thread, W.time.sleep)
+
+        class _Sync:
+            def __init__(self, target=None, args=(), kwargs=None, **_ignored):
+                self._t, self._a, self._k = target, tuple(args), dict(kwargs or {})
+
+            def start(self):
+                if self._t:
+                    self._t(*self._a, **self._k)
+
+        W.threading.Thread = _Sync
+        W.time.sleep = lambda _s: None
+        self.addCleanup(setattr, W.threading, "Thread", saved[0])
+        self.addCleanup(setattr, W.time, "sleep", saved[1])
+
+        self.win._on_mouse_press(QPointF(self.t.ox + 10, self.t.oy + 10), BUTTON_RIGHT)
+
+        xs = [c[0] for c in self.sent]
+        self.assertEqual(len(self.sent), W.BACK_SWIPE_STEPS + 3)
+        self.assertEqual(xs[0], self.t.crop_x, "手势必须从画面左缘起手")
+        step = max(2, int(self.t.content_w * W.BACK_SWIPE_DISTANCE_RATIO))
+        self.assertEqual(xs[-1], self.t.crop_x + step, "终点应走到画面 45% 处")
+        self.assertEqual(xs, sorted(xs), "必须是单向从左往右")
+        self.assertEqual(self.sent[1][2], BUTTON_LEFT, "按下的是左键（桥负责翻译成触摸）")
+        self.assertEqual(self.sent[-1][2], 0, "最后要抬起")
+        self.assertFalse(self.win._back_swipe_active)
 
 
 class TestBtReport(unittest.TestCase):
@@ -2936,6 +2971,18 @@ class TestWifiApHook(unittest.TestCase):
         self.assertIn("select_network", src)
         self.assertIn("10.201.126.2", src)
 
+class TestScanHook(unittest.TestCase):
+    """`DICTPEN_SCAN=0` 必须由 guest 的 S00scan 钩子落实：改注册表 props 才能真跳过预加载。"""
+
+    def test_initramfs_installs_the_scan_switch(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        src = (root / "scripts/initramfs-init.sh").read_text(encoding="utf-8")
+        self.assertIn("S00scan", src)
+        self.assertIn("DICTPEN_SCAN=0", src)
+        self.assertIn('"Preload": false', src)
+        self.assertIn("/userdisk/miniapp/data/mini_app/pkg/packages.json", src)
+
+
 class TestAudioCheck(unittest.TestCase):
     """`dpctl audio-check` 的两段纯逻辑：测试音格式、端点输出解析。
 
@@ -3067,6 +3114,111 @@ class TestSharedPayload(unittest.TestCase):
             seen[name] = staged
         self.assertEqual(seen["p5"], seen["x3s342"], "两包应指向同一份共享载荷")
         self.assertEqual(packlib._shared_tops(packlib.load_pack("p5")), ["_shared"])
+
+
+class TestScanLaunchOption(unittest.TestCase):
+    """启动前的「扫描翻译」开关：默认开、可持久化，快速启动固定关。"""
+
+    def setUp(self):
+        from vmgui.console import harness
+        self.h = harness
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = harness.SCAN_OFF_FLAG
+        harness.SCAN_OFF_FLAG = os.path.join(self.tmp.name, "scan-off.flag")
+        self.addCleanup(setattr, harness, "SCAN_OFF_FLAG", saved)
+        self.calls: list = []
+        saved_run = harness.run_dpctl
+        harness.run_dpctl = lambda args, timeout=600: (self.calls.append(list(args)) or (0, ""))
+        self.addCleanup(setattr, harness, "run_dpctl", saved_run)
+
+    def test_flag_defaults_on_and_round_trips(self):
+        self.assertTrue(self.h.scan_enabled())
+        self.h.set_scan_enabled(False)
+        self.assertFalse(self.h.scan_enabled())
+        self.h.set_scan_enabled(True)
+        self.assertTrue(self.h.scan_enabled())
+
+    def test_cold_start_only_passes_no_scan_when_disabled(self):
+        self.h.start_vm("s6pro", scan=True)
+        self.h.start_vm("s6pro", scan=False)
+        self.assertNotIn("--no-scan", self.calls[0])
+        self.assertIn("--no-scan", self.calls[1])
+
+    def test_fast_start_is_always_scan_off(self):
+        self.h.start_vm_fast("s6pro")
+        self.assertIn("--no-scan", self.calls[0])
+
+    def test_restart_follows_the_saved_flag(self):
+        self.h.set_scan_enabled(False)
+        self.h.restart_vm("s6pro")
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("--no-scan", self.calls[1])
+
+
+class TestLinuxPort(unittest.TestCase):
+    """Linux 宿主适配：外部工具查找、音频后端、进程探活与启动脚本。"""
+
+    def setUp(self):
+        from vmgui.console import harness
+        self.d = harness.DPCTL
+        self.root = pathlib.Path(__file__).resolve().parents[2]
+
+    def test_find_exe_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"DICTPEN_QEMU": "/opt/qemu-system-aarch64"}):
+            got = self.d._find_exe("DICTPEN_QEMU", [], ["qemu-system-aarch64"])
+        self.assertEqual(got, "/opt/qemu-system-aarch64")
+
+    def test_find_exe_falls_back_to_path(self):
+        env = {k: v for k, v in os.environ.items() if k != "DICTPEN_QEMU"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("shutil.which", return_value="/usr/bin/qemu-system-aarch64"):
+            got = self.d._find_exe("DICTPEN_QEMU", [], ["qemu-system-aarch64"])
+        self.assertEqual(got, "/usr/bin/qemu-system-aarch64")
+
+    def test_audio_backend_defaults_per_host(self):
+        with mock.patch.object(self.d, "is_windows", return_value=True):
+            self.assertEqual(self.d.default_audio_dev(), "dsound")
+        with mock.patch.object(self.d, "is_windows", return_value=False), \
+                mock.patch.dict(os.environ, {"PULSE_SERVER": "unix:/tmp/pulse"}):
+            self.assertEqual(self.d.default_audio_dev(), "pa")
+        with mock.patch.object(self.d, "is_windows", return_value=False), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("os.path.exists", return_value=False), \
+                mock.patch("shutil.which", return_value=None):
+            self.assertEqual(self.d.default_audio_dev(), "none")
+
+    def test_posix_pid_alive_uses_kill_zero(self):
+        # 只看分支：把 is_windows 钉成 False，并让 os.kill 记录收到的信号。
+        seen = []
+        with mock.patch.object(self.d, "is_windows", return_value=False), \
+                mock.patch("os.kill", side_effect=lambda pid, sig: seen.append((pid, sig))):
+            self.assertTrue(self.d.pid_alive(4321))
+        self.assertEqual(seen, [(4321, 0)])
+
+    def test_linux_launchers_exist_and_are_posix(self):
+        for name, target in (
+                ("run-vm.sh", "scripts/dpctl.py up"),
+                ("vm-console.sh", "scripts/dpctl.py console"),
+                ("console.sh", "scripts/console.py"),
+                ("stop-vm.sh", "scripts/dpctl.py down"),
+                ("ssh-vm.sh", "root@127.0.0.1")):
+            p = self.root / name
+            raw = p.read_bytes()
+            self.assertTrue(p.is_file(), name)
+            self.assertTrue(raw.startswith(b"#!/bin/sh"), name)
+            self.assertNotIn(b"\r\n", raw, f"{name} 必须是 LF")
+            self.assertIn(target, raw.decode("utf-8"), name)
+
+    def test_bootstrap_qemu_on_linux_uses_system_binary(self):
+        from scripts import bootstrap
+        item = {"id": "qemu", "check": "tools/msys2/ucrt64/bin/qemu-system-aarch64.exe",
+                "how": "auto-qemu"}
+        with mock.patch.object(bootstrap.os, "name", "posix"), \
+                mock.patch("shutil.which", return_value="/usr/bin/qemu-system-aarch64"):
+            st, detail = bootstrap.inspect(item)
+        self.assertEqual(st, bootstrap.OK)
+        self.assertIn("/usr/bin/qemu-system-aarch64", detail)
 
 
 if __name__ == "__main__":

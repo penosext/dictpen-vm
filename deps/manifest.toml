@@ -16,15 +16,16 @@ how = "file"
 url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-v1.5.7-win64.zip"
 into = "tools/zstd"
 optional = true    # 只有走 MSYS2 装 QEMU 才需要
+platform = "nt"    # Linux 用发行版 QEMU，不需要这个 Windows 工具
 
 [[item]]
 id = "qemu"
-what = "便携 QEMU 11.1 / MSYS2 ucrt64（含 GTK、slirp、virtio 等）"
+what = "QEMU 11.1（Windows 用便携 MSYS2；Linux 用发行版 qemu-system-aarch64）"
 check = "tools/msys2/ucrt64/bin/qemu-system-aarch64.exe"
-how = "msys2"
+how = "auto-qemu"
 mirror = "https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/ucrt64"
 packages = ["mingw-w64-ucrt-x86_64-qemu"]   # 依赖由 msys2-fetch.py 递归补齐
-note = "也可手动把官方 QEMU 解压到 tools/msys2/ucrt64/"
+note = "Linux：apt install qemu-system-arm qemu-utils（或 Fedora qemu-system-aarch64 qemu-img）"
 
 # ---------------------------------------------------------------- guest 侧内核与工具
 [[item]]

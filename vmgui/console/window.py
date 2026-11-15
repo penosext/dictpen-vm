@@ -3,7 +3,7 @@
 三条纪律照抄不改：
 
 * 设备视图**只画宿主收到的那帧**，尺寸从帧读、**按面板声明裁剪**（决策 #8 / #27）。
-* 触摸**单点**，滚轮 → 一次整屏 swipe（决策 #9）。
+* 触摸**单点**，滚轮 → 一次整屏 swipe（决策 #9）；鼠标右键 → 从左往右滑（返回/退出）。
 * 必须有一条**不依赖 VM 通道**的日志出口 —— 抽屉「串口」读宿主 `vm\\serial.log`（决策 #7）。
 
 空态文案与按钮见 `31-console-copy.md` §3；判据来自 `core/rules.py`，采集来自
@@ -19,8 +19,8 @@ import time
 from collections import deque
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget,
                                QSlider,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QHBoxL
                                QPushButton, QSizePolicy, QStackedWidget, QStatusBar,
                                QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
+from ..backends.base import BUTTON_LEFT, BUTTON_RIGHT
 from ..core import events as ev
 from ..core import logging as vlog
 from ..core import probe as P
@@ -67,6 +68,8 @@ TOOLTIPS = {"启动": "dpctl up --pack <名> --display none（控制台自己占
             "左上角返回": "按面板比例点击左上角返回位置；用于没有返回控件的拦截页"
                           "（键盘 Esc/Backspace 无效）",
             "暂停画面": "停下来看一帧；再按一次继续（继续时会立刻补一帧）",
+            "扫描翻译": "下次「启动」时是否让客机预加载「查词翻译」的扫描页；"
+                        "关掉能更快到首页（约 2 秒）。「快速启动」固定不预加载，不受此开关影响。",
             "抽屉": "展开/收起右侧（Tab）"}
 
 # `39` §2 #2 / §5 #8：面板里那行引导**不许**出现 `dpctl`（人不知道它是什么）。
@@ -211,11 +214,23 @@ ESCAPE_TAP_RATIO = {"default": (0.042, 0.16)}
 # 按住多久（ms）：与 `dpctl tap` 同口径 —— 太短会被 mousedev 当成抖动，不是一次点击。
 TAP_HOLD_MS = 220
 
+# 右键 → 「从左往右滑」返回手势：起点贴画面左缘，终点走到画面 45% 处。
+# 笔的返回是左缘手势（`LeftSwipeBackGesture`），起手必须贴着左边；步数/间隔与触控桥
+# 的拖动判定（CLICK_SLOP=4 px）配套 —— 640 宽的面板每步约 29 px，不会被当成点击抖动。
+BACK_SWIPE_STEPS = 10
+BACK_SWIPE_STEP_DELAY_S = 0.02
+BACK_SWIPE_DISTANCE_RATIO = 0.45
+
 
 def escape_tap_point(cw: int, ch: int, pack: str = "") -> tuple[int, int]:
     """面板内容尺寸 → 「点左上角」那颗键的 guest 坐标。"""
     rx, ry = ESCAPE_TAP_RATIO.get(pack, ESCAPE_TAP_RATIO["default"])
     return int(round(int(cw) * rx)), int(round(int(ch) * ry))
+
+
+def open_path(path: str) -> bool:
+    """用系统文件管理器打开路径（Windows Explorer / Linux xdg-open；Qt 跨平台）。"""
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(path)))
 
 
 def _size_text(n: int) -> str:
@@ -440,6 +455,7 @@ class ConsoleWindow(QMainWindow):
         # 在画面最上/最下一行上点了一下，人看到的就是"点在画面外，客机却动了，还动错地方"。
         # 所以要在"画面外"这一层挡住，而不是让钳位替人决定（`mapper.inside()` 本来就有）。
         self._touch_active = False    # 这一按是从画面内开始的（后续滑到画面外也要把抬起发出去）
+        self._back_swipe_active = False   # 右键返回手势正在发（期间的鼠标事件一律不转发）
         self._self_size = (0, 0)      # 我们最后一次"打算"的尺寸
         self._expect_resize = False   # 刚请求过 resize：下一个事件是我们的，不是用户的
         self._user_sized = False      # 用户拖过窗口，之后只改画布不改窗口
@@ -816,6 +832,13 @@ class ConsoleWindow(QMainWindow):
         self.chk_pause.setToolTip(TOOLTIPS["暂停画面"])
         self.chk_pause.toggled.connect(self._pause_toggled)
         row1.addWidget(self.chk_pause)
+        # 启动前选项：扫描翻译的预加载开关。只影响**下一次冷启动**，所以放在抽屉顶上
+        # 与设备操作同一排，而不是混进「配置」页（那里是显示/输入参数）。
+        self.chk_scan = QCheckBox("启动时启用扫描翻译")
+        self.chk_scan.setToolTip(TOOLTIPS["扫描翻译"])
+        self.chk_scan.setChecked(harness.scan_enabled())
+        self.chk_scan.toggled.connect(self._scan_toggled)
+        row1.addWidget(self.chk_scan)
         row1.addStretch(1)
         head_lay.addLayout(row1)
 
@@ -1165,7 +1188,7 @@ class ConsoleWindow(QMainWindow):
                     f"导出取证包 → {os.path.relpath(dest, harness.ROOT)}", 0,
                     f"{len(written)} 件 / 缺 {len(missing)} 件"
                     + ("：" + "、".join(missing) if missing else ""))
-                os.startfile(dest)                      # 顺手打开，别让人去找
+                open_path(dest)                         # 顺手打开，别让人去找
             except OSError as e:
                 self.bridge.file_op.emit("导出取证包失败", 1, str(e))
             finally:
@@ -1431,7 +1454,8 @@ class ConsoleWindow(QMainWindow):
         self.lbl_snd.setWordWrap(True)
         lay.addWidget(self.lbl_snd)
         self.lbl_snd_host = QLabel(
-            "宿主输出由 Windows 决定：听不到先查系统输出设备是否静音或音量为 0。")
+            "宿主输出由系统默认播放设备决定：听不到先查它是否静音或音量为 0"
+            "（Windows 声音设置 / Linux pactl、wpctl）。")
         self.lbl_snd_host.setWordWrap(True)
         lay.addWidget(self.lbl_snd_host)
         row = QHBoxLayout()
@@ -2128,10 +2152,11 @@ class ConsoleWindow(QMainWindow):
         self._busy = True
         self.act_start.setEnabled(False)
         self._started_at = time.time()
-        threading.Thread(target=self._start_worker, args=(pack,), daemon=True).start()
+        scan = self.chk_scan.isChecked()
+        threading.Thread(target=self._start_worker, args=(pack, scan), daemon=True).start()
 
-    def _start_worker(self, pack: str) -> None:
-        rc, out = harness.start_vm(pack)
+    def _start_worker(self, pack: str, scan: bool) -> None:
+        rc, out = harness.start_vm(pack, scan=scan)
         self.bridge.dpctl.emit("启动", rc, out)
 
     def _fast_start_clicked(self) -> None:
@@ -2146,6 +2171,8 @@ class ConsoleWindow(QMainWindow):
         self.act_start.setEnabled(False)
         self.act_fast.setEnabled(False)
         self._started_at = time.time()
+        if self.chk_scan.isChecked():
+            self._note("快速启动固定不预加载扫描翻译；「启动时启用扫描翻译」只影响下次冷启动")
         threading.Thread(target=self._fast_start_worker, args=(pack,), daemon=True).start()
 
     def _fast_start_worker(self, pack: str) -> None:
@@ -2384,6 +2411,12 @@ class ConsoleWindow(QMainWindow):
         if self._decision is not None:
             self.lbl_status.setText(self._status_text(self._decision))
 
+    def _scan_toggled(self, on: bool) -> None:
+        """「启动时启用扫描翻译」：只记到下次冷启动，不打扰正在跑的这台。"""
+        harness.set_scan_enabled(bool(on))
+        self._note("下次冷启动将预加载扫描翻译" if on
+                   else "下次冷启动跳过扫描翻译（快速启动始终跳过）")
+
     def _focus_serial(self) -> None:
         if not self._drawer_open:
             self._toggle_drawer(True)
@@ -2392,10 +2425,8 @@ class ConsoleWindow(QMainWindow):
 
     def _open_packs(self) -> None:
         path = os.path.join(harness.ROOT, "packs")
-        try:
-            os.startfile(path)                    # noqa: S606 (Windows)
-        except (AttributeError, OSError) as e:
-            self._note(f"打不开 {path}: {e}")
+        if not open_path(path):
+            self._note(f"打不开 {path}（系统没有文件管理器或用它打开失败）")
 
     def _rescan(self) -> None:
         harness.rescan()
@@ -2585,24 +2616,70 @@ class ConsoleWindow(QMainWindow):
         self._user_sized = True
 
     # ------------------------------------------------------------------ #
-    # 输入（单点；滚轮 → 一次整屏 swipe 由 canvas 的按钮位表达，决策 #9）
+    # 输入（单点；滚轮 → 一次整屏 swipe 由 canvas 的按钮位表达，决策 #9；
+    #       右键 → 从左往右滑，笔的返回/退出手势）
     # ------------------------------------------------------------------ #
     def _on_mouse_move(self, pos, buttons) -> None:
+        buttons = getattr(buttons, "value", buttons)
+        if self._back_swipe_active:
+            return                      # 返回手势发完之前，物理鼠标的事件不掺进去
         if not self._touch_active and not self._on_picture(pos):
             return                      # 画面外的悬停：不钳到边缘去打扰客机
         self._deliver(pos, buttons, absolute=True)
 
     def _on_mouse_press(self, pos, buttons) -> None:
+        buttons = getattr(buttons, "value", buttons)
+        if buttons & BUTTON_RIGHT:
+            # 右键不发给客机：笔要的是「从左缘往右滑」这条触摸手势，
+            # 右键本身只会被应用当成一次无关的鼠标按键。
+            self._start_back_swipe()
+            return
         if not self._on_picture(pos):
             return                      # 点黑边不算触摸（钳到边缘 = 点在画面最上/最下一行）
         self._touch_active = True
         self._deliver(pos, buttons, absolute=True)
 
     def _on_mouse_release(self, pos, buttons) -> None:
+        buttons = getattr(buttons, "value", buttons)
+        if self._back_swipe_active:
+            return                      # 手势由 worker 自己收尾；这里只挡住物理右键的抬起
         if not self._touch_active:
             return                      # 没在画面里按下过，就没有"抬起"要发
         self._touch_active = False      # 手指拖到画面外再抬，也得把按压松开
         self._deliver(pos, buttons, absolute=True)
+
+    def _start_back_swipe(self) -> None:
+        """右键 = 笔的返回手势：画面左缘 → 右侧 45%，一次单向拖动。
+
+        坐标取**画面内容**（裁剪后）而不是画布：手势是笔屏上的语义，窗口缩放/黑边
+        不该改变起点。没有帧（还没连上/没画面）时什么也不做。
+        """
+        if self._readonly or self._back_swipe_active:
+            return
+        t = self.canvas.transform()
+        if t is None:
+            return
+        x0 = t.crop_x
+        x1 = t.crop_x + max(2, int(t.content_w * BACK_SWIPE_DISTANCE_RATIO))
+        y = t.crop_y + t.content_h // 2
+        self._back_swipe_active = True
+        threading.Thread(target=self._back_swipe_worker, args=(x0, y, x1),
+                         daemon=True).start()
+
+    def _back_swipe_worker(self, x0: int, y: int, x1: int) -> None:
+        """按步发 abs + 左键拖动；触控桥会把左键翻译成 BTN_TOUCH 的按下/移动/抬起。"""
+        try:
+            self.session.pointer(x0, y, 0, True)             # 先落到左缘（按前定位）
+            time.sleep(BACK_SWIPE_STEP_DELAY_S)
+            self.session.pointer(x0, y, BUTTON_LEFT, True)   # 按下
+            time.sleep(BACK_SWIPE_STEP_DELAY_S)
+            for i in range(1, BACK_SWIPE_STEPS + 1):
+                x = int(round(x0 + (x1 - x0) * i / BACK_SWIPE_STEPS))
+                self.session.pointer(x, y, BUTTON_LEFT, True)
+                time.sleep(BACK_SWIPE_STEP_DELAY_S)
+            self.session.pointer(x1, y, 0, True)             # 抬起
+        finally:
+            self._back_swipe_active = False
 
     def _sync_key_actions(self) -> None:
         """按包刷新三颗实体键：亮不亮、发什么码都来自 patches/vm-keys.env。"""

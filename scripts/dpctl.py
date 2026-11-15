@@ -39,8 +39,10 @@ and you pick one at boot time.
   dpctl down               stop the VM
 
 Only the Python standard library is used.  `adb` is optional: it is looked up
-as tools/platform-tools/adb.exe, then on PATH; everything except `dpctl adb`
-also works over plain SSH.
+as tools/platform-tools/adb, then on PATH; everything except `dpctl adb`
+also works over plain SSH.  Host tools follow the same rule: `DICTPEN_QEMU` /
+`DICTPEN_QEMU_IMG` override, otherwise the bundled Windows build or PATH
+(`qemu-system-aarch64` + `qemu-img` on Linux).
 """
 import argparse
 import base64
@@ -49,6 +51,7 @@ import os
 import posixpath
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -59,21 +62,59 @@ import tomllib
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _find_exe(env_name, bundled=(), names=()):
+    """按 `环境变量 > 包内便携版（仅 Windows）> PATH` 找一个外部可执行文件。
+
+    Linux 宿主不读 `tools/msys2` 里的 `.exe`（那些是 Windows 便携工具），
+    直接用发行版装的 `qemu-system-aarch64` / `qemu-img`。
+    """
+    override = os.environ.get(env_name)
+    if override:
+        return override
+    if os.name == "nt":
+        for rel in bundled:
+            p = rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
+            if os.path.exists(p):
+                return p
+    for name in names:
+        p = shutil.which(name)
+        if p:
+            return p
+    return ""
+
+
+QEMU = _find_exe("DICTPEN_QEMU",
+                 ["tools/msys2/ucrt64/bin/qemu-system-aarch64.exe"],
+                 ["qemu-system-aarch64"])
+QEMU_IMG = _find_exe("DICTPEN_QEMU_IMG",
+                     ["tools/msys2/ucrt64/bin/qemu-img.exe"], ["qemu-img"])
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import packlib                                   # noqa: E402  固件包（packs/）
 import runtimes                                  # noqa: E402  可插拔 boot backend
 from packlib import PackError                    # noqa: E402
 from runtimes import BootContext, UnsupportedPlatform   # noqa: E402
 
-QEMU = os.path.join(ROOT, "tools", "msys2", "ucrt64", "bin", "qemu-system-aarch64.exe")
-QEMU_IMG = os.path.join(ROOT, "tools", "msys2", "ucrt64", "bin", "qemu-img.exe")
 KEY = os.path.join(ROOT, "tools", "ssh", "id_devvm")
 # 备用身份：部分固件的 dropbear 没编 ed25519，只认 ecdsa-sha2-*
 KEY_ECDSA = os.path.join(ROOT, "tools", "ssh", "id_devvm_ecdsa")
 # 宿主 sftp：`put`/`get` 的首选通道（路径带空格/中文也安全，二进制安全）。
 # 客机侧 serve 它的是 dropbear + /usr/libexec/sftp-server（千问在 a6pro 上实测读写都通）；
 # ⚠ 其余六包有没有 sftp-server 是**包侧事实**，没测过的不许外推。
-SFTP = shutil.which("sftp") or r"C:\Windows\System32\OpenSSH\sftp.exe"
+# Linux 宿主用 PATH 上的 sftp（openssh-client）；Windows 才回落 System32 那份。
+SFTP = _find_exe("DICTPEN_SFTP",
+                 [r"C:\Windows\System32\OpenSSH\sftp.exe"] if os.name == "nt" else [],
+                 ["sftp"])
+
+if os.name != "nt":
+    # POSIX OpenSSH 拒绝 0644 的私钥（"UNPROTECTED PRIVATE KEY FILE"）。
+    # bootstrap 生成时会收紧；这里兜住从 Windows 迁移过来、权限还是 644 的旧仓库。
+    for _key in (KEY, KEY_ECDSA):
+        try:
+            os.chmod(_key, 0o600)
+        except OSError:
+            pass
 
 VM = os.path.join(ROOT, "vm")
 PID_FILE = os.path.join(VM, "qemu.pid")
@@ -223,14 +264,16 @@ def pid_alive(pid):
             return _win_procs().pid_alive(int(pid))
         except Exception:
             return False
+    # Linux/macOS：`kill(pid, 0)` 只做存在性检查，不真的发信号。
+    # 比 `tasklist`/`pgrep` 便宜，也不会在控制台每帧探活时 spawn 进程。
     try:
-        # errors="replace"：中文版 Windows 的 tasklist 会输出 GBK 提示文本，
-        # 严格 UTF-8 解码会在 reader 线程里炸掉并把 stdout 变成 None
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                             capture_output=True, text=True, errors="replace",
-                             timeout=15).stdout
-        return str(pid) in (out or "")
-    except Exception:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                  # 进程在，只是不归当前用户
+    except OSError:
         return False
 
 
@@ -247,6 +290,20 @@ def read_pid():
 def qemu_pids():
     """All running qemu-system-aarch64 PIDs (works even if we did not start it)."""
     if not is_windows():
+        # Linux 读 /proc，不依赖 procps 的 pgrep；macOS 没有 /proc，再回落 pgrep。
+        pids = []
+        if os.path.isdir("/proc"):
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{name}/cmdline", "rb") as f:
+                        cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                except OSError:
+                    continue
+                if "qemu-system-aarch64" in cmd:
+                    pids.append(int(name))
+            return sorted(pids)
         out = subprocess.run(["pgrep", "-f", "qemu-system-aarch64"],
                              capture_output=True, text=True).stdout
         return [int(x) for x in out.split() if x.isdigit()]
@@ -319,7 +376,8 @@ def guest_run(cmd, timeout=60, force_serial=False):
 
 
 def find_adb():
-    local = os.path.join(ROOT, "tools", "platform-tools", "adb.exe")
+    local = os.path.join(ROOT, "tools", "platform-tools",
+                         "adb.exe" if is_windows() else "adb")
     if os.path.exists(local):
         return local
     return shutil.which("adb")
@@ -349,7 +407,7 @@ def guest_adb_up(timeout=30):
 def host_adb_connect(verbose=True):
     adb = find_adb()
     if not adb:
-        return None, "adb not found (expected tools/platform-tools/adb.exe or on PATH)"
+        return None, "adb not found (tools/platform-tools/ or PATH)"
     subprocess.run([adb, "start-server"], capture_output=True, timeout=60)
     p = subprocess.run([adb, "connect", adb_serial()], capture_output=True,
                        text=True, timeout=30)
@@ -437,7 +495,10 @@ def find_pyside_python():
             cands.append(["py", "-" + ver])
         cands.append(["python"])
     else:
-        cands += [["python3"], ["python"]]
+        # 先试当前解释器（在 venv 里跑 dpctl 时它就是装了 PySide6 的那个），
+        # 再试发行版的 python3 与常见版本名。
+        cands += [[sys.executable], ["python3"], ["python"],
+                  ["python3.13"], ["python3.12"], ["python3.11"], ["python3.10"]]
     for c in cands:
         try:
             p = subprocess.run(c + ["-c", "import PySide6"],
@@ -493,11 +554,14 @@ def cmd_attach(args):
     → 拉一个 vmgui 连上去；控制台占着 QMP → 画面在控制台里，不能开第二个前端。
     """
     if not vm_running():
-        print("dpctl: 虚拟机没在跑；先 run-vm.cmd（等于 `up`）")
+        print("dpctl: 虚拟机没在跑；先 `dpctl up`（或 run-vm.sh / run-vm.cmd）")
         return 1
     owner = qmp_owner() or ""
     if owner.startswith("vmgui"):
         pid = int(owner.split()[-1])
+        if not is_windows():
+            print(f"实时画面窗口在跑（vmgui pid {pid}）；Linux 宿主请用窗口管理器切换。")
+            return 0
         if raise_window(_win_window_for_pid(pid)):
             print("已把实时画面窗口调到前台。")
             return 0
@@ -505,7 +569,7 @@ def cmd_attach(args):
         return 1
     if owner.startswith("console"):
         print("画面现在由控制台窗口负责（QMP 只服务一个客户端）：切到控制台即可；"
-              "或者先关掉控制台再跑 run-vm.cmd。")
+              "或者先关掉控制台再跑 run-vm.sh / run-vm.cmd。")
         return 1
     py = find_pyside_python()
     if not py:
@@ -589,6 +653,21 @@ def stop_console():
     return _kill_pid_file(CONSOLE_PID_FILE)
 
 
+def kill_pid(pid, force=True):
+    """按 pid 收进程。Windows 走 `taskkill`，Linux/macOS 走 `os.kill`。"""
+    if not pid:
+        return
+    if is_windows():
+        # errors="replace"：中文 Windows 上 taskkill 的话是 cp936，解码失败不该变成主角
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, text=True, errors="replace")
+        return
+    try:
+        os.kill(int(pid), signal.SIGKILL if force else signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+
+
 def _kill_pid_file(path):
     """按记账文件收掉一个进程；顺手清掉失效的记账。返回 pid 或 None。"""
     pid = None
@@ -597,12 +676,7 @@ def _kill_pid_file(path):
     except (OSError, ValueError):
         pid = None
     if pid:
-        # `errors="replace"`：**中文 Windows 上 taskkill 的话是 cp936**（"未找到进程…"），
-        # 而 `text=True` 默认按 locale 之外的 utf-8 解 → 读线程抛 `UnicodeDecodeError`，
-        # 每条 `dpctl down` 尾巴上印一段 traceback（实测 2026-10-19，bt-emu 那格）。
-        # 这里的输出**没人看**，更不许它变成主角。
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, text=True, errors="replace")
+        kill_pid(pid, force=True)
     try:
         os.remove(path)
     except OSError:
@@ -639,7 +713,7 @@ def start_console(pack=""):
     if not py:
         print("[!] 没找到能 import PySide6 的解释器，控制台起不来。")
         print("    装依赖：python -m pip install PySide6")
-        print("    或指定：set DICTPEN_VMGUI_PYTHON=<那个能用的 python.exe>")
+        print("    或指定：DICTPEN_VMGUI_PYTHON=<能 import PySide6 的 python>")
         return 1
     # 双击两次是这里最常见的形状。两个控制台抢一个 QMP 的后果不是"报错"，
     # 而是**其中一个永远拿不到帧**（QEMU 的 chardev 只服务一个客户端），
@@ -725,6 +799,22 @@ def state_img_for(pack_name):
     return os.path.join(VM, f"state-{pack_name}.img")
 
 
+def default_audio_dev():
+    """宿主的 QEMU 音频后端：Windows 用 dsound，Linux 用 PulseAudio/PipeWire 或 ALSA。"""
+    if is_windows():
+        return "dsound"
+    if os.environ.get("PULSE_SERVER"):
+        return "pa"
+    try:
+        if os.path.exists(f"/run/user/{os.getuid()}/pulse/native"):
+            return "pa"
+    except AttributeError:
+        pass
+    if os.path.exists("/dev/snd") or shutil.which("aplay"):
+        return "alsa"
+    return "none"
+
+
 def grow_state_image(pack_name, want_mib):
     """把某包的状态盘**只往大**扩到 `want_mib` MiB（`qemu-img resize`）→ `(rc, 说明)`。
 
@@ -737,6 +827,9 @@ def grow_state_image(pack_name, want_mib):
       还是旧的；要在跑起来之后进客机 `resize2fs /dev/vdb`（在线扩，实测 a6pro 有
       `/sbin/resize2fs`）。少这一步就是"扩了但用不上"。
     """
+    if not QEMU_IMG:
+        return 1, ("找不到 qemu-img。Linux 装 qemu-utils（Debian/Ubuntu）或 qemu-img；"
+                   "也可用 DICTPEN_QEMU_IMG 指定。")
     path = state_img_for(pack_name)
     try:
         now = os.path.getsize(path) // (1024 * 1024)
@@ -834,7 +927,11 @@ def save_fast_snapshot(pack_name, force=False):
     """把当前**冷启动状态盘**复制成独立的 qcow2，启动到首页后 savevm。
 
     快照里没有 usb-audio（不可迁移），所以快跑那一路没有声音；冷启动保留声音。
+    存快照的这一趟固定 `--no-scan`：快照里不预加载「扫描翻译」，恢复后才能快。
     """
+    if not QEMU_IMG:
+        return 1, ("找不到 qemu-img。Linux 装 qemu-utils（Debian/Ubuntu）或 qemu-img；"
+                   "也可用 DICTPEN_QEMU_IMG 指定。")
     if vm_running():
         return 1, "虚拟机在跑 —— 先关机，再存快照。"
     raw = state_img_for(pack_name)
@@ -872,7 +969,7 @@ def save_fast_snapshot(pack_name, force=False):
     with open(log_path, "ab") as logf:
         r = subprocess.run([sys.executable, "-X", "utf8", os.path.abspath(__file__),
                             "up", "--pack", pack_name, "--display", "none",
-                            "--no-audio"], cwd=ROOT, env=env,
+                            "--no-audio", "--no-scan"], cwd=ROOT, env=env,
                            stdout=logf, stderr=subprocess.STDOUT, timeout=180)
     if r.returncode != 0:
         return 1, f"启动快照盘失败（见 {os.path.relpath(log_path, ROOT)}）"
@@ -1325,6 +1422,12 @@ def cmd_up(args):
             print(f"  {rel}  期望 {want}  实际 {got}")
         return 2
 
+    if not QEMU:
+        print("dpctl: 找不到 qemu-system-aarch64。")
+        print("       Linux:  apt install qemu-system-arm qemu-utils   （Fedora: qemu-system-aarch64 qemu-img）")
+        print("       或设 DICTPEN_QEMU=/path/to/qemu-system-aarch64")
+        return 2
+
     if getattr(args, "fast", False):
         st = fast_status(pack.name)
         if not st["ready"]:
@@ -1342,6 +1445,9 @@ def cmd_up(args):
                   f"当前机器是 {mem_now}/{smp_now} vCPU；改回去或重建快照")
             return 2
         args.audio = False
+        if getattr(args, "scan", True):
+            print("fast: 快速启动不使用「扫描翻译」预加载（固定 --no-scan）")
+        args.scan = False
         os.environ["DICTPEN_STATE_IMG"] = st["state"]
         os.environ["DICTPEN_STATE_FMT"] = "qcow2"
         os.environ["DICTPEN_LOADVM"] = FAST_TAG
@@ -1366,6 +1472,10 @@ def cmd_up(args):
     if args.fresh and os.path.exists(state_img):
         os.remove(state_img)
     if not os.path.exists(state_img):
+        if not QEMU_IMG:
+            print("dpctl: 第一次起机要新建状态盘，但找不到 qemu-img。")
+            print("       Linux: apt install qemu-utils；或设 DICTPEN_QEMU_IMG=/path/to/qemu-img")
+            return 2
         subprocess.run([QEMU_IMG, "create", "-f", "raw", state_img, f"{state_size}M"],
                        check=True, capture_output=True)
         print(f"created {os.path.relpath(state_img, ROOT)} ({state_size}M, formatted on first boot)")
@@ -1376,6 +1486,10 @@ def cmd_up(args):
         append += " DICTPEN_DEVMODE=1"
     if args.license is False:
         append += " DICTPEN_LICENSE=0"
+    # 扫描翻译（「查词翻译」SCANTRANS 页）的预加载开关：S00scan 钩子据此改写
+    # guest 的应用注册表。关掉能省掉起机时那 2 秒左右的页面预加载。
+    if not getattr(args, "scan", True):
+        append += " DICTPEN_SCAN=0"
     # 真设备凭证：开机钩子（S00sysinfo）读这四个，写进 system_info.bin
     for k, v in (("sn", getattr(args, "sn", None)),
                  ("uuid", getattr(args, "uuid", None)),
@@ -1425,8 +1539,9 @@ def cmd_up(args):
     # `no default audio driver available`（实测）。客机侧要 snd 模块（见 initrd 清单）。
     # 走 USB 声卡（人选的方案②）：HDA 那条路客机侧 `Cannot probe codecs`，改用 xhci + usb-audio。
     audio_kind = os.environ.get("DICTPEN_AUDIO", "usb")
-    # 宿主后端可换：dsound 在某些 Windows 端点上会“客机在跑、宿主没声”；sdl/wav 用来 A/B。
-    audio_dev = os.environ.get("DICTPEN_AUDIODEV", "dsound")
+    # 宿主后端可换：Windows 默认 dsound（某些端点会“客机在跑、宿主没声”），
+    # Linux 默认 PulseAudio（无 Pulse 时 ALSA），sdl/wav/none 用来 A/B。
+    audio_dev = os.environ.get("DICTPEN_AUDIODEV") or default_audio_dev()
     if audio_dev == "wav":
         audio_dev += ",id=snd0,path=" + os.path.join(VM, "audio-capture.wav")
     else:
@@ -1542,8 +1657,7 @@ def cmd_down(args):
     if vm_running():
         print("guest did not stop; killing qemu")
         for p in qemu_pids():
-            subprocess.run(["taskkill", "/F", "/PID", str(p)],
-                           capture_output=True, text=True, errors="replace")
+            kill_pid(p, force=True)
     if os.path.exists(PID_FILE):
         os.remove(PID_FILE)
     _stop_helpers()
@@ -1610,7 +1724,7 @@ def cmd_status(args):
             if line.strip():
                 print(f"device:  {line.strip()}")
     else:
-        print("adb:     not found (tools/platform-tools/adb.exe)")
+        print("adb:     not found (tools/platform-tools/ or PATH)")
     return 0
 
 
@@ -2020,7 +2134,8 @@ def _endpoint_probe(extra=()):
 def cmd_audio_check(args):
     """客机放一段测试音，确认它真的到达宿主默认输出。"""
     if os.name != "nt":
-        print("audio-check: 只在 Windows 宿主上可用（端点状态走 Core Audio）")
+        print("audio-check: 宿主端点检查目前只在 Windows 实现；"
+              "Linux 可用 `pactl list sinks` 或 `wpctl status` 看默认输出是否静音。")
         return 1
     if not vm_running():
         print("audio-check: 虚拟机没在跑，先 dpctl up")
@@ -2437,10 +2552,13 @@ def main():
     p.add_argument("--fresh", action="store_true", help="wipe the persistent state disk")
     p.add_argument("--fast", action="store_true",
                    help="从快速启动快照恢复（无声音；快照用 `dpctl fast save` 建）")
+    p.add_argument("--scan", action=argparse.BooleanOptionalAction, default=True,
+                   help="冷启动时预加载「扫描翻译」查词页（默认开）；--no-scan 跳过它，"
+                        "起机更快。快速启动固定不加载")
     p.add_argument("--headless", action="store_true", help="no GUI at all")
     p.add_argument("--audio", action=argparse.BooleanOptionalAction, default=True,
-                   help="客机声音送到宿主机（默认开：QEMU usb-audio + 宿主 dsound）；"
-                        "--no-audio 关掉")
+                   help="客机声音送到宿主机（默认开：QEMU usb-audio；Windows 走 dsound，"
+                        "Linux 走 PulseAudio/ALSA）；--no-audio 关掉")
     p.add_argument("--display", choices=["vmgui", "gtk", "none", "vnc"], default="vmgui",
                    help="显示前端：vmgui（默认，QMP + PySide6 客户端）| gtk（QEMU 自带窗口）"
                         "| none（不要窗口）| vnc（画面走 VNC 推流 tcp:127.0.0.1:4448，"

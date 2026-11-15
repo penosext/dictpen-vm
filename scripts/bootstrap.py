@@ -306,6 +306,13 @@ def how_ssh_key(item):
             subprocess.run(["icacls", path, "/inheritance:r",
                             "/grant:r", f"{user}:R"], capture_output=True, text=True)
             print(f"    已收紧权限: {rel(path)}")
+    else:
+        # POSIX 的 OpenSSH 同样会因为 0644 的私钥直接拒绝登录。
+        for path, _, _ in keys:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
 
 
 def _openssl():
@@ -316,7 +323,8 @@ def _openssl():
 def how_cert(item):
     bad = _openssl()
     if not bad:
-        raise Manual("没有 openssl（装完 QEMU 后 tools/msys2/ucrt64/bin/openssl.exe 就有）")
+        raise Manual("没有 openssl（Linux 装 openssl 包；Windows 装完 QEMU 后"
+                     "tools/msys2/ucrt64/bin/openssl.exe 就有）")
     out = under(item["check"])
     os.makedirs(os.path.dirname(out), exist_ok=True)
     run([bad, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
@@ -379,12 +387,23 @@ def how_http(item):
                  f.get("size", 0), f["md5"], threads)
 
 
+def how_auto_qemu(item):
+    """QEMU：Windows 用包内便携 MSYS2 版；Linux 用发行版包（不下载 .exe）。"""
+    if os.name == "nt":
+        return how_msys2(item)
+    if shutil.which("qemu-system-aarch64") and shutil.which("qemu-img"):
+        return                                  # 系统包已就位（--force 也走这里）
+    raise Manual("Linux 用发行版 QEMU：Ubuntu/Debian 装 qemu-system-arm + qemu-utils；"
+                 "Fedora 装 qemu-system-aarch64 + qemu-img")
+
+
 def how_manual(item):
     raise Manual(item.get("where", "") + ("  " + item.get("note", "")
                                          if item.get("note") else ""))
 
 
-HANDLERS = {"file": how_file, "msys2": how_msys2, "deb": how_deb,
+HANDLERS = {"file": how_file, "msys2": how_msys2, "auto-qemu": how_auto_qemu,
+            "deb": how_deb,
             "deb-arm64": how_deb_arm64, "ssh-key": how_ssh_key, "cert": how_cert,
             "initramfs": how_initramfs, "firmware": how_firmware,
             "http": how_http, "manual": how_manual}
@@ -397,6 +416,23 @@ class Manual(Exception):
 # --------------------------------------------------------------------------- #
 def inspect(item):
     """(状态, 说明)。已有文件时顺带校验 md5。"""
+    if item["id"] == "qemu" and os.name != "nt":
+        q = shutil.which("qemu-system-aarch64")
+        img = shutil.which("qemu-img")
+        if q and img:
+            return OK, f"系统 QEMU: {q} + {img}"
+        missing = "qemu-system-aarch64" if not q else "qemu-img"
+        return MISS, (f"缺 {missing}（Ubuntu/Debian: "
+                      "apt install qemu-system-arm qemu-utils）")
+    if item["id"] == "adb":
+        local = under("tools/platform-tools/adb.exe" if os.name == "nt"
+                      else "tools/platform-tools/adb")
+        if os.path.exists(local):
+            return OK, rel(local)
+        q = shutil.which("adb")
+        if q:
+            return OK, f"系统 adb: {q}"
+        return MISS, "缺 adb（tools/platform-tools/ 或 PATH）"
     paths = [item["check"]] + list(item.get("also", []))
     for p in paths:
         check = under(p)
@@ -422,6 +458,9 @@ def inspect(item):
 def hint(item):
     """只给下载指引、不碰网络（用于 --check）。"""
     how = item["how"]
+    if how == "auto-qemu" and os.name != "nt":
+        return ("      apt install qemu-system-arm qemu-utils"
+                "\n      （Fedora: qemu-system-aarch64 qemu-img）")
     if how == "firmware":
         into = item.get("into", "downloads")
         todo = [f for f in item["files"]
@@ -469,6 +508,9 @@ def main():
         print(f"清单 {rel(MANIFEST)} 语法错误: {e}")
         return 2
     items = manifest["item"]
+    items = [i for i in items
+             if i.get("platform") in (None, "any")
+             or (i["platform"] == "nt") == (os.name == "nt")]
     if args.only:
         items = [i for i in items if i["id"] == args.only]
         if not items:

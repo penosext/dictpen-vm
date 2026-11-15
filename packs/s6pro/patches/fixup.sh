@@ -60,6 +60,21 @@ fi
 if [ -d /patches/perl-tree/usr ] && [ -d "$TARGET/usr" ]; then
     cp -r /patches/perl-tree/usr/bin/. $TARGET/usr/bin/
     cp -r /patches/perl-tree/usr/lib/arm-linux-gnueabihf/. $TARGET/usr/lib/arm-linux-gnueabihf/
+    # 架构无关的核心模块（strict.pm / warnings.pm / Fcntl.so …）在
+    # usr/share/perl/<版本>：漏掉这一层时 touchbridge.pl / vm-keys.pl 直接
+    # "Can't locate strict.pm in @INC"，触摸桥每次开机都失败、axs_ts 不存在，
+    # 表现为“设备在但点不动”。必须一起进 target。
+    if [ -d /patches/perl-tree/usr/share/perl ]; then
+        mkdir -p $TARGET/usr/share/perl
+        cp -r /patches/perl-tree/usr/share/perl/. $TARGET/usr/share/perl/
+    fi
+    # 这版 perl 的 @INC 是 Debian 布局（/usr/share/perl/5.20、
+    # /usr/lib/arm-linux-gnueabihf/perl/5.20），包里解出来的目录却叫 5.20.2。
+    # 不补这两个 5.20 -> 5.20.2 的链接，strict.pm / Fcntl.so 依然找不到。
+    for pdir in $TARGET/usr/share/perl $TARGET/usr/lib/arm-linux-gnueabihf/perl; do
+        [ -d "$pdir/5.20.2" ] || continue
+        [ -e "$pdir/5.20" ] || ln -sfn 5.20.2 "$pdir/5.20"
+    done
     # vendor ld-2.23 不搜 multiarch 目录，libperl 再放一份到默认路径
     cp -f $TARGET/usr/lib/arm-linux-gnueabihf/libperl.so.5.20 $TARGET/usr/lib/
     chmod 755 $TARGET/usr/bin/perl
@@ -202,6 +217,54 @@ fi
 TPEOF
     chmod +x "$TARGET/etc/init.d/S00tp-link"
     echo "pack hook fixup: S00tp-link installed"
+fi
+
+# --- 4a. 触摸桥（框架钩子有两处开机即死，这里整体重写）---------------------------
+# 框架生成的 S00touchbridge 有两个问题（两者叠加 = “设备在但点不动”）：
+#   1) 桥靠 perl 跑，而 vendor rootfs 的 perl 缺 @INC 里的核心模块（strict.pm
+#      / Fcntl.so）——上面 2e 已把 share 树和 5.20 兼容链接装好，这里再显式给
+#      PERL5LIB，避免依赖发行版 @INC 的具体写法；
+#   2) 兜底链接写的是 /dev/input/by-path/QEMU-Virtio-Tablet，但那个 by-path
+#      链接由 udev(S10) 才创建，而本钩子在 S00 跑 —— ln 失败、axs_ts 不存在，
+#      cfg.json 的 tp 打不开，app 日志就是 "input open fail"。
+# 因此这里重写整个钩子：自己 mkdir by-path、自己按 sysfs 名字找裸 tablet。
+if [ -n "$TARGET" ] && [ -d "$TARGET/etc/init.d" ]; then
+    cat > "$TARGET/etc/init.d/S00touchbridge" <<'TBEOF'
+#!/bin/sh
+# s6pro: 启动 uinput 触摸桥，并把 cfg.json 的 tp（axs_ts）指到它。
+mkdir -p /dev/input/by-path
+if [ -e /dev/uinput ] && [ -f /root/.vm/touchbridge.pl ] \
+   && [ ! -e /dev/input/by-path/axs_ts ]; then
+    PERL5LIB=/usr/share/perl/5.20.2:/usr/lib/arm-linux-gnueabihf/perl/5.20.2 \
+        setsid /usr/bin/perl /root/.vm/touchbridge.pl >/tmp/touchbridge.log 2>&1 </dev/null &
+    i=0
+    while [ $i -lt 50 ]; do
+        [ -e /dev/input/by-path/axs_ts ] && break
+        sleep 0.1
+        i=$((i+1))
+    done
+fi
+if [ -e /dev/input/by-path/axs_ts ]; then
+    echo "S00touchbridge: touch device ready" >/dev/kmsg
+else
+    # 桥不可用：至少把裸 virtio tablet 链上，app 能打开 tp 不至于完全没触摸
+    for d in /sys/class/input/input*/name; do
+        [ "$(cat "$d" 2>/dev/null)" = "QEMU Virtio Tablet" ] || continue
+        inp=${d%/name}
+        for e in "$inp"/event*; do
+            ev=$(basename "$e")
+            [ -e "/dev/input/$ev" ] && ln -sf "/dev/input/$ev" /dev/input/by-path/axs_ts
+        done
+    done
+    if [ -e /dev/input/by-path/axs_ts ]; then
+        echo "S00touchbridge: bridge failed, raw tablet linked" >/dev/kmsg
+    else
+        echo "S00touchbridge: no touch device at all" >/dev/kmsg
+    fi
+fi
+TBEOF
+    chmod +x "$TARGET/etc/init.d/S00touchbridge"
+    echo "pack hook fixup: S00touchbridge hardened"
 fi
 
 # --- 9. mousedev 缩放 = 面板尺寸（触摸光标对齐，2026-10-06）---------------------
